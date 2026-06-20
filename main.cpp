@@ -5,7 +5,6 @@
 #include <Wire.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
-#include <NonBlockingRTTTL.h>
 #include <time.h>
 #include <WiFiManager.h>
 #include <PrayerTimes.h>
@@ -13,17 +12,13 @@
 // --- Hardware Pins ---
 #define OLED_SDA 14
 #define OLED_SCL 15
-#define BUZZER_PIN 13
+#define LED_PIN 13  // Status LED pin (Change to 4 if you want to use the onboard flash LED)
 
 // --- Display Configuration ---
 #define SCREEN_WIDTH 128
 #define SCREEN_HEIGHT 64
 #define OLED_RESET -1
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
-
-// --- Audio Melodies ---
-const char *warningMelody = "Warning:d=4,o=5,b=120:8c6,8e6,2g6";
-const char *adhanMelody = "Adhan:d=4,o=5,b=90:2c,2c#,4e,4f,2g,2g,4g,4f,4e,4c#,2c";
 
 // --- State Variables ---
 float latitude = 0.0;
@@ -32,16 +27,25 @@ float tzOffsetHours = 0.0;
 long tzOffsetSecs = 0;
 int lastDay = -1;
 
-// Stores upcoming prayer times as minutes since midnight
 int prayerTimesMins[5] = {0}; 
 const char* prayerNames[5] = {"Fajr", "Dhuhr", "Asr", "Maghrib", "Isha"};
 
 bool warningPlayed[5] = {false};
 bool adhanPlayed[5] = {false};
 
+// --- LED Blink Engine State ---
+enum AlertState { LED_OFF, WARNING_BLINK, ADHAN_BLINK };
+AlertState currentAlert = LED_OFF;
+unsigned long alertStartTime = 0;
+unsigned long lastBlinkToggle = 0;
+bool ledState = false;
+
+const unsigned long ALERT_DURATION = 10000; // Total time the LED flashes per event (10 seconds)
+const unsigned int WARNING_INTERVAL = 500;  // Slow blink for 10-min warning (500ms)
+const unsigned int ADHAN_INTERVAL = 100;    // Rapid strobe for actual Adhan (100ms)
+
 // --- Core Functions ---
 
-// Get Location & Timezone from IP Address
 bool fetchLocationData() {
     HTTPClient http;
     http.begin("http://ip-api.com/json/?fields=lat,lon,offset,status");
@@ -56,35 +60,30 @@ bool fetchLocationData() {
             latitude = doc["lat"];
             longitude = doc["lon"];
             tzOffsetSecs = doc["offset"];
-            tzOffsetHours = tzOffsetSecs / 3600.0; // Math library uses fractional hours
+            tzOffsetHours = tzOffsetSecs / 3600.0;
             return true;
         }
     }
     return false;
 }
 
-// Perform entirely offline math to get today's exact adhan schedule
 void calculateOfflinePrayerTimes(struct tm &timeinfo) {
     int year = timeinfo.tm_year + 1900;
     int month = timeinfo.tm_mon + 1;
     int day = timeinfo.tm_mday;
 
-    // Configure the offline math logic
-    set_calc_method(ISNA); // ISNA standard (15 degrees)
+    set_calc_method(ISNA); 
     
-    // The library returns 7 fractional hour values (Fajr, Sunrise, Dhuhr, Asr, Sunset, Maghrib, Isha)
     double pTimes[7];
     get_prayer_times(year, month, day, latitude, longitude, tzOffsetHours, pTimes);
     
-    // Extract the 5 adhans and convert fractional hours (e.g., 5.5) to minutes (330)
-    prayerTimesMins[0] = (int)(pTimes[0] * 60); // Fajr
-    prayerTimesMins[1] = (int)(pTimes[2] * 60); // Dhuhr
-    prayerTimesMins[2] = (int)(pTimes[3] * 60); // Asr
-    prayerTimesMins[3] = (int)(pTimes[5] * 60); // Maghrib
-    prayerTimesMins[4] = (int)(pTimes[6] * 60); // Isha
+    prayerTimesMins[0] = (int)(pTimes[0] * 60); 
+    prayerTimesMins[1] = (int)(pTimes[2] * 60); 
+    prayerTimesMins[2] = (int)(pTimes[3] * 60); 
+    prayerTimesMins[3] = (int)(pTimes[5] * 60); 
+    prayerTimesMins[4] = (int)(pTimes[6] * 60); 
 }
 
-// Draw the screen UI
 void updateDisplay(int h, int m, int nextIndex, int minsLeft) {
     display.clearDisplay();
     display.setTextColor(SSD1306_WHITE);
@@ -132,8 +131,35 @@ void updateDisplay(int h, int m, int nextIndex, int minsLeft) {
     display.display();
 }
 
+// Non-blocking processing engine for managing visual LED sequences
+void handleLEDEngine() {
+    if (currentAlert == LED_OFF) {
+        return;
+    }
+
+    // Shut down flashing sequence if time window expires
+    if (millis() - alertStartTime >= ALERT_DURATION) {
+        currentAlert = LED_OFF;
+        digitalWrite(LED_PIN, LOW);
+        ledState = false;
+        return;
+    }
+
+    unsigned int currentInterval = (currentAlert == WARNING_BLINK) ? WARNING_INTERVAL : ADHAN_INTERVAL;
+
+    // Toggle pin step based on elapsed interval cadence
+    if (millis() - lastBlinkToggle >= currentInterval) {
+        ledState = !ledState;
+        digitalWrite(LED_PIN, ledState ? HIGH : LOW);
+        lastBlinkToggle = millis();
+    }
+}
+
 void setup() {
     Serial.begin(115200);
+    pinMode(LED_PIN, OUTPUT);
+    digitalWrite(LED_PIN, LOW);
+
     Wire.begin(OLED_SDA, OLED_SCL);
     if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) { for(;;); }
     
@@ -148,9 +174,8 @@ void setup() {
     display.display();
 
     WiFiManager wm;
-    // Spawns access point if no saved networks are found
     if (!wm.autoConnect("ESP32-Adhan-Setup")) {
-        ESP.restart(); // Retry if it stalls
+        ESP.restart(); 
     }
 
     // --- Step 2: Fetch Region Data ---
@@ -174,24 +199,24 @@ void setup() {
         delay(500); 
     }
 
-    // Run first calculation
     calculateOfflinePrayerTimes(timeinfo);
     lastDay = timeinfo.tm_mday;
 
-    // --- Step 4: SEVER INTERNET AND SHUT DOWN RADIO ---
-    WiFi.disconnect(true, false); // Disconnect, but leave credentials saved in NVS for next boot
-    WiFi.mode(WIFI_OFF);          // Completely powers down the Wi-Fi hardware and web server
+    // --- Step 4: Sever Internet Operations ---
+    WiFi.disconnect(true, false); 
+    WiFi.mode(WIFI_OFF);          
 }
 
 void loop() {
-    rtttl::play(); 
+    // Process lighting tasks continuously at maximum frequency execution loop
+    handleLEDEngine(); 
     
     struct tm timeinfo;
     if (!getLocalTime(&timeinfo)) return; 
     
     int currentMins = timeinfo.tm_hour * 60 + timeinfo.tm_min;
     
-    // Midnight reset: Calculate completely offline!
+    // Midnight reset
     if (timeinfo.tm_mday != lastDay) {
         if (lastDay != -1) {
             calculateOfflinePrayerTimes(timeinfo);
@@ -217,13 +242,20 @@ void loop() {
     
     int minsLeft = targetTime - currentMins;
     
+    // Alarm Triggers targeting specific timing slots
     for (int i = 0; i < 5; i++) {
+        // 10-Minute Warning (Slow Flash Initialization)
         if (!warningPlayed[i] && currentMins == (prayerTimesMins[i] - 10)) {
-            rtttl::begin(BUZZER_PIN, warningMelody);
+            currentAlert = WARNING_BLINK;
+            alertStartTime = millis();
+            lastBlinkToggle = millis();
             warningPlayed[i] = true;
         }
+        // Actual Adhan Time (Fast Strobe Initialization)
         if (!adhanPlayed[i] && currentMins == prayerTimesMins[i]) {
-            rtttl::begin(BUZZER_PIN, adhanMelody);
+            currentAlert = ADHAN_BLINK;
+            alertStartTime = millis();
+            lastBlinkToggle = millis();
             adhanPlayed[i] = true;
         }
     }
@@ -234,5 +266,5 @@ void loop() {
         lastOledUpdate = millis();
     }
     
-    delay(50); 
+    delay(10); // Keeps processing loop tight for precise LED timing resolution
 }
